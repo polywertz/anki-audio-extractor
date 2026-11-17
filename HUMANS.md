@@ -32,11 +32,9 @@ To get readable names, set **Name files after** to **First field** before you cl
 
 ## Three ways to start
 
-| I want audio from… | Where to click |
-|---|---|
-| A package file I downloaded | **Tools → Extract Audio from Package** |
-| A deck I already have | On the deck list, click the **gear** next to the deck → **Export Audio…** |
-| Only some cards | In the **Browser**, select the cards → **Notes → Export Audio from Selected Cards…** (also in the right-click menu) |
+- **A package file you downloaded:** **Tools → Extract Audio from Package**
+- **A deck you already have:** on the deck list, click the **gear** next to the deck → **Export Audio…**
+- **Only some cards:** in the **Browser**, select the cards → **Notes → Export Audio from Selected Cards…** (also in the right-click menu)
 
 All three open the same export dialog.
 
@@ -77,18 +75,16 @@ All three open the same export dialog.
 
 ## The export options
 
-| Option | What it does |
-|---|---|
-| **Output folder** | Where the audio is saved. |
-| **Take audio from** | Appears when notes have audio in more than one field. Untick a field to leave its audio out. |
-| **Name files after** | Original name, the first field, any field you pick, or **Pattern of several fields…** |
-| **Pattern** | Field names in braces, for example `{Word} ({Reading})`. |
-| **Number files in card order** | Adds `0001_`, `0002_`, … to the start of each name. Files from the same note share a number. |
-| **Put each deck's audio in its own folder** | Makes a folder for each deck and subfolders for subdecks. |
-| **If a file already exists** | Keep both (`hello (2).mp3`), skip, or overwrite. |
-| **Also save audio_notes.csv** | Saves a spreadsheet with each file's note details. |
-| **Also save audio_playlist.m3u8** | Saves a playlist in card order. |
-| **Preview Names…** | Shows every new name, and whether that file would be numbered, skipped or replace an existing file. |
+- **Output folder:** where the audio is saved.
+- **Take audio from:** appears when notes have audio in more than one field. Untick a field to leave its audio out.
+- **Name files after:** the original name, the first field, any field you pick, or **Pattern of several fields…**
+- **Pattern:** field names in braces, for example `{Word} ({Reading})`.
+- **Number files in card order:** adds `0001_`, `0002_`, … to the start of each name. Files from the same note share a number.
+- **Put each deck's audio in its own folder:** makes a folder for each deck and subfolders for subdecks.
+- **If a file already exists:** keep both (`hello (2).mp3`), skip, or overwrite.
+- **Also save audio_notes.csv:** saves a spreadsheet with each file's note details.
+- **Also save audio_playlist.m3u8:** saves a playlist in card order.
+- **Preview Names…:** shows every new name, and whether that file would be numbered, skipped or replace an existing file.
 
 **Tips**
 - **Order you study in:** turn on numbering, or save a playlist if you'd rather keep the names clean.
