@@ -2,5 +2,7 @@
     "last_output_dir": "",
     "name_files_after": "original",
     "if_file_exists": "rename",
-    "write_csv": false
+    "write_csv": false,
+    "number_prefix": false,
+    "excluded_audio_fields": []
 }

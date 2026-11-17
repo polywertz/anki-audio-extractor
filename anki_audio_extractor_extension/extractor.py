@@ -1,4 +1,4 @@
-"""Extract audio files from Anki .apkg / .colpkg packages.
+"""Extract audio files from Anki packages or from cards in a collection.
 
 This module has no Qt/aqt imports so it can be tested outside of Anki.
 
@@ -11,8 +11,8 @@ Two package layouts exist:
   ``media`` is a zstd-compressed ``MediaEntries`` protobuf and every numbered
   zip member is zstd-compressed.
 
-The package's collection is opened as well, so that audio files can be named
-after the notes that use them and listed in a CSV.
+The package's collection is opened as well, so that audio files can be put in
+card order, named after the notes that use them and listed in a CSV.
 """
 
 from __future__ import annotations
@@ -22,12 +22,11 @@ import html
 import json
 import os
 import re
-import shutil
 import tempfile
 import unicodedata
 import zipfile
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 AUDIO_EXTENSIONS = (
     ".mp3", ".ogg", ".oga", ".opus", ".wav", ".m4a", ".aac",
@@ -50,7 +49,7 @@ SKIPPED = "skipped"
 OVERWRITTEN = "overwritten"
 
 CSV_NAME = "audio_notes.csv"
-_MAX_STEM_BYTES = 150  # leaves room for " (123).ext" under the usual 255-byte limit
+_MAX_STEM_BYTES = 150  # leaves room for a number prefix and " (123).ext" under 255 bytes
 
 
 class ExtractionError(Exception):
@@ -62,19 +61,27 @@ class ExtractOptions:
     name_field: Optional[str] = None
     on_conflict: str = RENAME
     write_csv: bool = False
+    # Prefix file names with their note's position in card order: "0001_name.mp3".
+    # Files from the same note share a number.
+    number_prefix: bool = False
+    # Only extract audio played from these fields. None means every field, plus
+    # audio in a package that no note plays.
+    audio_fields: Optional[frozenset[str]] = None
 
 
 @dataclass
 class ExtractedFile:
-    original: str  # name inside the package
+    original: str  # name in the package / media folder
     name: str  # name in the output folder
     status: str
+    number: Optional[int] = None  # position of its note in card order
 
 
 @dataclass
 class ExtractionResult:
     files: list[ExtractedFile] = field(default_factory=list)
     csv_path: Optional[str] = None
+    missing: list[str] = field(default_factory=list)  # referenced but not in the media folder
 
     @property
     def names(self) -> list[str]:
@@ -84,13 +91,14 @@ class ExtractionResult:
         return sum(f.status == status for f in self.files)
 
 
-@dataclass
+@dataclass(eq=False)  # compared and hashed by identity
 class _Note:
     id: int
     note_type: str
     fields: dict[str, str]  # field name -> raw HTML, in note type order
     tags: str
     deck: str
+    refs: list[tuple[str, str]]  # (field name, sound file name), in field order
 
 
 def is_audio(name: str) -> bool:
@@ -126,6 +134,14 @@ def _zstd_decompressor() -> Optional[Callable[[bytes], bytes]]:
         return decompress
     except ImportError:
         return None
+
+
+def _file_loader(path: str) -> Callable[[], bytes]:
+    def load() -> bytes:
+        with open(path, "rb") as f:
+            return f.read()
+
+    return load
 
 
 # --- Turning field HTML into text and file names -----------------------------
@@ -166,51 +182,109 @@ def filename_stem(text: str) -> Optional[str]:
     return s
 
 
-# --- Reading packages ---------------------------------------------------------
+# --- Reading notes ------------------------------------------------------------
 
 
-class Package:
-    """An opened Anki package. Use as a context manager, or call close().
+def _read_notes(col: Any, card_rows: Iterable[tuple[int, int]], only_listed: bool) -> list[_Note]:
+    """Read notes in the order their cards appear in ``card_rows`` ((note id, deck id) pairs).
 
-    Opening is the slow part (it may import the package into a scratch
-    collection), so a Package can be inspected first and extracted from later.
+    Each note's deck is the deck of its first listed card. With ``only_listed``
+    False, every note in the collection is read and notes without listed cards
+    come last.
     """
+    first_deck: dict[int, int] = {}
+    for nid, did in card_rows:
+        first_deck.setdefault(nid, did)
+    if only_listed:
+        from anki.utils import ids2str
 
-    def __init__(self, apkg_path: str) -> None:
-        if not os.path.isfile(apkg_path):
-            raise ExtractionError(f"File does not exist: {apkg_path}")
-        self.path = apkg_path
-        self._tmp = tempfile.TemporaryDirectory()
-        self._col: Any = None
-        self._zf: Optional[zipfile.ZipFile] = None
-        # (name in package, loader of its bytes), audio only
-        self._media: list[tuple[str, Callable[[], bytes]]] = []
-        try:
-            self._open()
-            self._notes, self._refs = self._read_notes()
-        except BaseException:
-            self.close()
-            raise
+        sql = f"select id, mid, flds, tags from notes where id in {ids2str(first_deck)}"
+    else:
+        sql = "select id, mid, flds, tags from notes"
+    rows = col.db.all(sql)
+    position = {nid: i for i, nid in enumerate(first_deck)}
+    rows.sort(key=lambda r: (position.get(r[0], len(position)), r[0]))
+
+    note_types: dict[int, tuple[str, list[str]]] = {}
+    deck_names: dict[int, str] = {}
+    notes = []
+    for nid, mid, flds, tags in rows:
+        if mid not in note_types:
+            model = col.models.get(mid)
+            note_types[mid] = (model["name"], [f["name"] for f in model["flds"]]) if model else ("", [])
+        type_name, names = note_types[mid]
+        values = flds.split("\x1f")
+        names = names + [f"Field {i + 1}" for i in range(len(names), len(values))]
+        fields = dict(zip(names, values))
+        did = first_deck.get(nid)
+        if did is not None and did not in deck_names:
+            deck_names[did] = col.decks.name(did)
+        refs = [(fname, ref) for fname, value in fields.items() for ref in sound_refs(value)]
+        notes.append(_Note(nid, type_name, fields, tags.strip(), deck_names.get(did, ""), refs))
+    return notes
+
+
+def _package_card_order(col: Any) -> list[tuple[int, int]]:
+    """Cards of a package in study order: by deck, then new-card position, then creation."""
+    decks = {did: col.decks.name(did) for did in {r[0] for r in col.db.all("select distinct did from cards")}}
+    rows = col.db.all("select nid, did, type, due, ord, id from cards")
+    rows.sort(key=lambda r: (decks.get(r[1], ""), r[2] != 0, r[3] if r[2] == 0 else 0, r[0], r[4]))
+    return [(r[0], r[1]) for r in rows]
+
+
+# --- Audio sources ------------------------------------------------------------
+
+
+@dataclass
+class _Planned:
+    original: str
+    load: Callable[[], bytes]
+    users: list[_Note]  # notes that play it (from the chosen fields), in card order
+    number: int
+
+
+class AudioSource:
+    """Audio files plus the notes that play them. Subclasses fill the fields."""
+
+    def __init__(self) -> None:
+        self._media: dict[str, Callable[[], bytes]] = {}  # file name -> loader, audio only
+        self._notes: list[_Note] = []  # in card order
+        self._has_notes = False
+        self.missing: list[str] = []
 
     # Public API
 
     @property
-    def audio_names(self) -> list[str]:
-        return [name for name, _ in self._media]
+    def has_notes(self) -> bool:
+        """False if the notes couldn't be read (naming, numbering and CSV unavailable)."""
+        return self._has_notes
 
     @property
-    def has_notes(self) -> bool:
-        """False if the package's collection couldn't be read (naming/CSV unavailable)."""
-        return self._col is not None
+    def audio_names(self) -> list[str]:
+        return [p.original for p in self._plan(None)]
+
+    def audio_count(self, audio_fields: Optional[Iterable[str]] = None) -> int:
+        return len(self._plan(frozenset(audio_fields) if audio_fields is not None else None))
 
     @property
     def field_names(self) -> list[str]:
-        """Field names of the notes in the package, in note type order."""
+        """Field names of the notes, in note type order."""
         seen: dict[str, None] = {}
         for note in self._notes:
             for name in note.fields:
                 seen.setdefault(name, None)
         return list(seen)
+
+    @property
+    def audio_field_names(self) -> list[str]:
+        """Fields that play at least one of the audio files."""
+        media = self._media_by_nfc()
+        seen: dict[str, None] = {}
+        for note in self._notes:
+            for fname, ref in note.refs:
+                if ref in media:
+                    seen.setdefault(fname, None)
+        return [f for f in self.field_names if f in seen]
 
     def extract(self, output_dir: str, options: Optional[ExtractOptions] = None) -> ExtractionResult:
         options = options or ExtractOptions()
@@ -218,22 +292,162 @@ class Package:
             raise ValueError(f"Unknown conflict policy: {options.on_conflict}")
         os.makedirs(output_dir, exist_ok=True)
 
-        result = ExtractionResult()
+        plan = self._plan(options.audio_fields)
+        width = max(4, len(str(max((p.number for p in plan), default=0))))
+        result = ExtractionResult(missing=list(self.missing))
         used: set[str] = set()
-        for original, load in self._media:
-            desired = self._desired_name(original, options.name_field)
+        for item in plan:
+            desired = self._desired_name(item, options.name_field)
+            if options.number_prefix:
+                desired = f"{item.number:0{width}d}_{desired}"
             name, status = _resolve(output_dir, desired, used, options.on_conflict)
             if status != SKIPPED:
                 with open(os.path.join(output_dir, name), "wb") as f:
-                    f.write(load())
-            result.files.append(ExtractedFile(original, name, status))
+                    f.write(item.load())
+            result.files.append(ExtractedFile(item.original, name, status, item.number))
 
         if options.write_csv and self.has_notes:
             csv_policy = OVERWRITE if options.on_conflict == OVERWRITE else RENAME
             csv_name, _ = _resolve(output_dir, CSV_NAME, used, csv_policy)
             result.csv_path = os.path.join(output_dir, csv_name)
-            self._write_csv(result.csv_path, result.files)
+            self._write_csv(result.csv_path, plan, result.files)
         return result
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> "AudioSource":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # Internals
+
+    def _media_by_nfc(self) -> dict[str, str]:
+        return {_nfc(name): name for name in self._media}
+
+    def _plan(self, audio_fields: Optional[frozenset[str]]) -> list[_Planned]:
+        """The files to extract, in card order, each with the notes that play it.
+
+        Files are numbered by the first note that plays them, counting only
+        notes that bring in a new file, so the numbers have no gaps. Audio no
+        note plays comes last, and only when no field filter is set.
+        """
+        media = self._media_by_nfc()
+        planned: dict[str, _Planned] = {}
+        number = 0
+        for note in self._notes:
+            note_number = None
+            for fname, ref in note.refs:
+                if audio_fields is not None and fname not in audio_fields:
+                    continue
+                name = media.get(ref)
+                if name is None:
+                    continue
+                item = planned.get(name)
+                if item is None:
+                    if note_number is None:
+                        number += 1
+                        note_number = number
+                    planned[name] = _Planned(name, self._media[name], [note], note_number)
+                elif item.users[-1] is not note:
+                    item.users.append(note)
+        if audio_fields is None:
+            for name in sorted(n for n in self._media if n not in planned):
+                number += 1
+                planned[name] = _Planned(name, self._media[name], [], number)
+        return list(planned.values())
+
+    def _desired_name(self, item: _Planned, name_field: Optional[str]) -> str:
+        if not name_field or not item.users:
+            return item.original
+        note = item.users[0]  # the first note in card order that plays this file
+        if name_field == FIRST_FIELD:
+            value = next(iter(note.fields.values()), "")
+        else:
+            value = note.fields.get(name_field, "")
+        stem = filename_stem(plain_text(value))
+        if not stem:
+            return item.original
+        return stem + os.path.splitext(item.original)[1]
+
+    def _write_csv(self, path: str, plan: list[_Planned], files: list[ExtractedFile]) -> None:
+        field_cols = self.field_names
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:  # BOM so Excel reads UTF-8
+            w = csv.writer(f)
+            w.writerow(
+                ["number", "file", "original_file", "note_id", "deck", "note_type", "tags", *field_cols]
+            )
+            for item, out in zip(plan, files):
+                start = [item.number, out.name, out.original]
+                if not item.users:  # audio that no note plays
+                    w.writerow([*start, "", "", "", "", *[""] * len(field_cols)])
+                for note in item.users:
+                    w.writerow([
+                        *start, note.id, note.deck, note.note_type, note.tags,
+                        *[plain_text(note.fields.get(c, "")) for c in field_cols],
+                    ])
+
+
+class SelectedCards(AudioSource):
+    """Audio played by the given cards of an open collection, e.g. a Browser selection.
+
+    ``card_ids`` sets the order. Reading needs the collection; extracting only
+    copies files from the media folder, so it can run without it.
+    """
+
+    def __init__(self, col: Any, card_ids: Sequence[int]) -> None:
+        super().__init__()
+        from anki.utils import ids2str
+
+        by_card = {
+            cid: (nid, did)
+            for cid, nid, did in col.db.all(
+                f"select id, nid, did from cards where id in {ids2str(card_ids)}"
+            )
+        }
+        rows = [by_card[c] for c in card_ids if c in by_card]
+        self._notes = _read_notes(col, rows, only_listed=True)
+        self._has_notes = True
+        self.note_count = len(self._notes)
+
+        media_dir = col.media.dir()
+        missing: dict[str, None] = {}
+        for note in self._notes:
+            for _, ref in note.refs:
+                name = _safe_name(ref)
+                if not name or not is_audio(name) or name in self._media:
+                    continue
+                path = os.path.join(media_dir, name)
+                if os.path.isfile(path):
+                    self._media[name] = _file_loader(path)
+                else:
+                    missing.setdefault(name, None)
+        self.missing = list(missing)
+
+
+class Package(AudioSource):
+    """An opened .apkg / .colpkg. Use as a context manager, or call close().
+
+    Opening is the slow part (it may import the package into a scratch
+    collection), so a Package can be inspected first and extracted from later.
+    """
+
+    def __init__(self, apkg_path: str) -> None:
+        super().__init__()
+        if not os.path.isfile(apkg_path):
+            raise ExtractionError(f"File does not exist: {apkg_path}")
+        self.path = apkg_path
+        self._tmp = tempfile.TemporaryDirectory()
+        self._col: Any = None
+        self._zf: Optional[zipfile.ZipFile] = None
+        try:
+            self._open()
+            self._load_notes()
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
         if self._col is not None:
@@ -246,12 +460,6 @@ class Package:
             self._zf.close()
             self._zf = None
         self._tmp.cleanup()
-
-    def __enter__(self) -> "Package":
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
 
     # Opening
 
@@ -272,7 +480,6 @@ class Package:
                 self._open_modern(decompress)
             else:
                 self._open_via_import()
-        self._media.sort(key=lambda m: m[0])
 
     def _open_legacy(self) -> None:
         zf = self._zf
@@ -286,7 +493,7 @@ class Package:
         for member, real_name in media_map.items():
             name = _safe_name(real_name)
             if name and is_audio(name) and member in members:
-                self._media.append((name, lambda m=member: zf.read(m)))
+                self._media[name] = lambda m=member: zf.read(m)
 
         # collection.anki2 is only a "please upgrade" stub when .anki21 exists.
         col_member = "collection.anki21" if "collection.anki21" in members else "collection.anki2"
@@ -310,7 +517,7 @@ class Package:
             )
             name = _safe_name(entry.name)
             if name and is_audio(name) and member in members:
-                self._media.append((name, lambda m=member: decompress(zf.read(m))))
+                self._media[name] = lambda m=member: decompress(zf.read(m))
 
         self._col = self._try_open_collection(decompress(zf.read("collection.anki21b")))
 
@@ -363,94 +570,28 @@ class Package:
         media_dir = self._col.media.dir()
         for name in os.listdir(media_dir):
             if is_audio(name):
-                path = os.path.join(media_dir, name)
+                self._media[name] = _file_loader(os.path.join(media_dir, name))
 
-                def load(p: str = path) -> bytes:
-                    with open(p, "rb") as f:
-                        return f.read()
-
-                self._media.append((name, load))
-
-    # Notes
-
-    def _read_notes(self) -> tuple[list[_Note], dict[str, list[_Note]]]:
-        """Read every note, and map each sound file name to the notes using it."""
-        col = self._col
-        if col is None:
-            return [], {}
+    def _load_notes(self) -> None:
+        if self._col is None:
+            return
         try:
-            decks: dict[int, str] = {}
-            for nid, did in col.db.all("select nid, did from cards order by id"):
-                if nid not in decks:
-                    decks[nid] = col.decks.name(did)
-
-            field_names: dict[int, tuple[str, list[str]]] = {}
-            notes, refs = [], {}
-            for nid, mid, flds, tags in col.db.all(
-                "select id, mid, flds, tags from notes order by id"
-            ):
-                if mid not in field_names:
-                    model = col.models.get(mid)
-                    field_names[mid] = (
-                        (model["name"], [f["name"] for f in model["flds"]]) if model else ("", [])
-                    )
-                type_name, names = field_names[mid]
-                values = flds.split("\x1f")
-                names = names + [f"Field {i + 1}" for i in range(len(names), len(values))]
-                note = _Note(nid, type_name, dict(zip(names, values)), tags.strip(), decks.get(nid, ""))
-                notes.append(note)
-                for value in values:
-                    for ref in sound_refs(value):
-                        users = refs.setdefault(ref, [])
-                        if not users or users[-1] is not note:
-                            users.append(note)
-            return notes, refs
+            self._notes = _read_notes(self._col, _package_card_order(self._col), only_listed=False)
+            self._has_notes = True
         except Exception:
             # Unreadable collection: carry on with original names and no CSV.
+            self._notes = []
             self._col.close(downgrade=False)
             self._col = None
-            return [], {}
-
-    def _desired_name(self, original: str, name_field: Optional[str]) -> str:
-        if not name_field:
-            return original
-        users = self._refs.get(_nfc(original))
-        if not users:
-            return original
-        note = users[0]  # the oldest note that plays this file
-        if name_field == FIRST_FIELD:
-            value = next(iter(note.fields.values()), "")
-        else:
-            value = note.fields.get(name_field, "")
-        stem = filename_stem(plain_text(value))
-        if not stem:
-            return original
-        return stem + os.path.splitext(original)[1]
-
-    def _write_csv(self, path: str, files: list[ExtractedFile]) -> None:
-        field_cols = self.field_names
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:  # BOM so Excel reads UTF-8
-            w = csv.writer(f)
-            w.writerow(["file", "original_file", "note_id", "deck", "note_type", "tags", *field_cols])
-            for item in files:
-                users = self._refs.get(_nfc(item.original)) or [None]
-                for note in users:
-                    if note is None:  # audio that no note plays
-                        w.writerow([item.name, item.original, "", "", "", "", *[""] * len(field_cols)])
-                        continue
-                    w.writerow([
-                        item.name, item.original, note.id, note.deck, note.note_type, note.tags,
-                        *[plain_text(note.fields.get(c, "")) for c in field_cols],
-                    ])
 
 
 def _resolve(output_dir: str, desired: str, used: set[str], on_conflict: str) -> tuple[str, str]:
     """Pick the output name for ``desired``.
 
     Names already produced by this extraction (e.g. two clips on one note named
-    after the same field) always get a number, so nothing from the package is
-    lost. ``on_conflict`` decides what happens with files that were already in
-    the output folder.
+    after the same field) always get a number, so nothing is lost.
+    ``on_conflict`` decides what happens with files that were already in the
+    output folder.
     """
     stem, ext = os.path.splitext(desired)
 
