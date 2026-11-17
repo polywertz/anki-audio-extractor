@@ -13,16 +13,24 @@ Two package layouts exist:
 
 The package's collection is opened as well, so that audio files can be put in
 card order, named after the notes that use them and listed in a CSV.
+
+Extracted files keep their modification time where one is known: from the
+media folder for decks and Browser selections, and from the zip entry for
+packages. Anki before 2.1.50 stored each media file's own time (local time);
+the current exporter, which always writes a ``meta`` entry, stores the time
+of the export (UTC).
 """
 
 from __future__ import annotations
 
+import calendar
 import csv
 import html
 import json
 import os
 import re
 import tempfile
+import time
 import unicodedata
 import zipfile
 from dataclasses import dataclass, field
@@ -150,6 +158,22 @@ def _file_loader(path: str) -> Callable[[], bytes]:
             return f.read()
 
     return load
+
+
+def _zip_time(info: zipfile.ZipInfo, utc: bool) -> Optional[float]:
+    """A zip entry's time as a timestamp, or None if it isn't a real time.
+
+    Zip times have no time zone, so the caller says how to read them.
+    1980-01-01 is the earliest time a zip can hold, used when none was set.
+    """
+    if info.date_time[:3] == (1980, 1, 1):
+        return None
+    try:
+        if utc:
+            return float(calendar.timegm(info.date_time))
+        return time.mktime((*info.date_time, 0, 0, -1))
+    except (OverflowError, ValueError):
+        return None
 
 
 # --- Turning field HTML into text and file names -----------------------------
@@ -365,6 +389,7 @@ class AudioSource:
 
     def __init__(self) -> None:
         self._media: dict[str, Callable[[], bytes]] = {}  # file name -> loader, audio only
+        self._mtimes: dict[str, float] = {}  # file name -> modification time, where known
         self._notes: list[_Note] = []  # in card order
         self._has_notes = False
         self.missing: list[str] = []
@@ -419,6 +444,12 @@ class AudioSource:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "wb") as f:
                     f.write(item.load())
+                mtime = self._mtimes.get(item.original)
+                if mtime is not None:
+                    try:
+                        os.utime(path, (mtime, mtime))
+                    except OSError:
+                        pass  # some file systems refuse; the file itself is fine
 
         # Lists always go in the top folder; they never skip, so they stay current.
         list_policy = OVERWRITE if options.on_conflict == OVERWRITE else RENAME
@@ -580,6 +611,7 @@ class SelectedCards(AudioSource):
                 path = os.path.join(media_dir, name)
                 if os.path.isfile(path):
                     self._media[name] = _file_loader(path)
+                    self._mtimes[name] = os.path.getmtime(path)
                 else:
                     missing.setdefault(name, None)
         self.missing = list(missing)
@@ -629,6 +661,7 @@ class Package(AudioSource):
         names = self._zf.namelist()
         if "media" not in names:
             raise ExtractionError("No media list found in the package.")
+        self._utc_times = "meta" in names
 
         if "collection.anki21b" not in names:
             self._open_legacy()
@@ -652,6 +685,7 @@ class Package(AudioSource):
             name = _safe_name(real_name)
             if name and is_audio(name) and member in members:
                 self._media[name] = lambda m=member: zf.read(m)
+                self._set_zip_time(name, member)
 
         # collection.anki2 is only a "please upgrade" stub when .anki21 exists.
         col_member = "collection.anki21" if "collection.anki21" in members else "collection.anki2"
@@ -676,8 +710,15 @@ class Package(AudioSource):
             name = _safe_name(entry.name)
             if name and is_audio(name) and member in members:
                 self._media[name] = lambda m=member: decompress(zf.read(m))
+                self._set_zip_time(name, member)
 
         self._col = self._try_open_collection(decompress(zf.read("collection.anki21b")))
+
+    def _set_zip_time(self, name: str, member: str) -> None:
+        assert self._zf is not None
+        mtime = _zip_time(self._zf.getinfo(member), self._utc_times)
+        if mtime is not None:
+            self._mtimes[name] = mtime
 
     def _try_open_collection(self, data: bytes) -> Any:
         """Open a copy of the package's collection, or return None if that fails.
@@ -708,6 +749,9 @@ class Package(AudioSource):
         )
 
         assert self._zf is not None
+        # The importer stamps files with the time of import. Every entry of a
+        # modern package carries the export time, so use that instead.
+        package_time = _zip_time(self._zf.getinfo("collection.anki21b"), self._utc_times)
         self._zf.close()
         self._zf = None
 
@@ -729,6 +773,8 @@ class Package(AudioSource):
         for name in os.listdir(media_dir):
             if is_audio(name):
                 self._media[name] = _file_loader(os.path.join(media_dir, name))
+                if package_time is not None:
+                    self._mtimes[name] = package_time
 
     def _load_notes(self) -> None:
         if self._col is None:
