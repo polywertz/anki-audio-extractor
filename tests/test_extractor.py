@@ -10,6 +10,7 @@ packages in every format the current Anki can produce.
 import importlib.util
 import json
 import os
+import sys
 import zipfile
 from pathlib import Path
 
@@ -22,6 +23,7 @@ _spec = importlib.util.spec_from_file_location(
     "extractor", ROOT / "anki_audio_extractor_extension" / "extractor.py"
 )
 extractor = importlib.util.module_from_spec(_spec)
+sys.modules["extractor"] = extractor  # dataclasses look the module up here
 _spec.loader.exec_module(extractor)
 
 MEDIA = {
@@ -79,8 +81,8 @@ def _check_output(out_dir, names):
 
 
 def test_modern_package_direct(packages, tmp_path):
-    names = extractor.extract_audio_from_apkg(packages["modern"], str(tmp_path))
-    _check_output(tmp_path, names)
+    result = extractor.extract_audio_from_apkg(packages["modern"], str(tmp_path))
+    _check_output(tmp_path, result.names)
 
 
 def test_modern_package_with_zstandard_module(packages, tmp_path, monkeypatch):
@@ -90,31 +92,31 @@ def test_modern_package_with_zstandard_module(packages, tmp_path, monkeypatch):
         "_zstd_decompressor",
         lambda: lambda d: zstandard.ZstdDecompressor().decompressobj().decompress(d),
     )
-    names = extractor.extract_audio_from_apkg(packages["modern"], str(tmp_path))
-    _check_output(tmp_path, names)
+    result = extractor.extract_audio_from_apkg(packages["modern"], str(tmp_path))
+    _check_output(tmp_path, result.names)
 
 
 def test_modern_package_import_fallback(packages, tmp_path, monkeypatch):
     # Anki's bundled Python may have no zstd module; then Anki's importer is used.
     monkeypatch.setattr(extractor, "_zstd_decompressor", lambda: None)
-    names = extractor.extract_audio_from_apkg(packages["modern"], str(tmp_path))
-    _check_output(tmp_path, names)
+    result = extractor.extract_audio_from_apkg(packages["modern"], str(tmp_path))
+    _check_output(tmp_path, result.names)
 
 
 def test_colpkg(packages, tmp_path):
-    names = extractor.extract_audio_from_apkg(packages["colpkg"], str(tmp_path))
-    _check_output(tmp_path, names)
+    result = extractor.extract_audio_from_apkg(packages["colpkg"], str(tmp_path))
+    _check_output(tmp_path, result.names)
 
 
 def test_colpkg_import_fallback(packages, tmp_path, monkeypatch):
     monkeypatch.setattr(extractor, "_zstd_decompressor", lambda: None)
-    names = extractor.extract_audio_from_apkg(packages["colpkg"], str(tmp_path))
-    _check_output(tmp_path, names)
+    result = extractor.extract_audio_from_apkg(packages["colpkg"], str(tmp_path))
+    _check_output(tmp_path, result.names)
 
 
 def test_legacy_package(packages, tmp_path):
-    names = extractor.extract_audio_from_apkg(packages["legacy"], str(tmp_path))
-    _check_output(tmp_path, names)
+    result = extractor.extract_audio_from_apkg(packages["legacy"], str(tmp_path))
+    _check_output(tmp_path, result.names)
 
 
 def test_legacy_keeps_unreferenced_audio(packages, tmp_path):
@@ -129,13 +131,13 @@ def test_legacy_keeps_unreferenced_audio(packages, tmp_path):
                 dst.writestr(info, src.read(info))
         dst.writestr("99", b"orphan")
     out = tmp_path / "out"
-    names = extractor.extract_audio_from_apkg(str(pkg), str(out))
+    names = extractor.extract_audio_from_apkg(str(pkg), str(out)).names
     assert "orphan.mp3" in names
     assert (out / "orphan.mp3").read_bytes() == b"orphan"
 
 
 def test_no_media(packages, tmp_path):
-    assert extractor.extract_audio_from_apkg(packages["nomedia"], str(tmp_path)) == []
+    assert extractor.extract_audio_from_apkg(packages["nomedia"], str(tmp_path)).files == []
     assert os.listdir(tmp_path) == []
 
 
@@ -153,7 +155,7 @@ def test_path_traversal_is_blocked(tmp_path):
         z.writestr("0", b"x")
         z.writestr("1", b"y")
     out = tmp_path / "out"
-    names = extractor.extract_audio_from_apkg(str(pkg), str(out))
+    names = extractor.extract_audio_from_apkg(str(pkg), str(out)).names
     assert sorted(names) == ["evil.mp3", "win.mp3"]
     assert sorted(os.listdir(out)) == ["evil.mp3", "win.mp3"]
     assert not (tmp_path / "evil.mp3").exists()
@@ -185,3 +187,200 @@ def test_zip_without_media_list(tmp_path):
 )
 def test_is_audio(name, expected):
     assert extractor.is_audio(name) is expected
+
+
+# --- Naming, CSV and conflicts ------------------------------------------------
+
+RICH_MEDIA = {f"a{i}.mp3": f"audio {i}".encode() for i in range(1, 6)}
+
+
+@pytest.fixture(scope="session")
+def rich_packages(tmp_path_factory):
+    src = tmp_path_factory.mktemp("rich_src")
+    out = tmp_path_factory.mktemp("rich_pkgs")
+    col = Collection(str(src / "c.anki2"))
+    for name, data in RICH_MEDIA.items():
+        p = src / name
+        p.write_bytes(data)
+        col.media.add_file(str(p))
+
+    deck = col.decks.id("Lang::Japanese")
+    basic = col.models.by_name("Basic")
+
+    def add(model, tags=(), **fields):
+        note = col.new_note(model)
+        for k, v in fields.items():
+            note[k] = v
+        note.tags = list(tags)
+        col.add_note(note, deck)
+
+    add(basic, tags=["animal"], Front="猫 <b>(neko)</b>", Back="cat[sound:a1.mp3]")
+    add(basic, Front="What? / Why?", Back="[sound:a2.mp3]<br>[sound:a3.mp3]")
+    add(basic, Front="[sound:a4.mp3]", Back="")
+    add(basic, Front="dog", Back="[sound:a1.mp3]")
+
+    mm = col.models
+    vocab = mm.new("Vocab")
+    for f in ("Word", "Audio"):
+        mm.add_field(vocab, mm.new_field(f))
+    tmpl = mm.new_template("Card 1")
+    tmpl["qfmt"], tmpl["afmt"] = "{{Word}}", "{{Audio}}"
+    mm.add_template(vocab, tmpl)
+    mm.add(vocab)
+    add(mm.by_name("Vocab"), Word="hello &amp; bye", Audio="[sound:a5.mp3]")
+
+    def export(name, legacy):
+        path = str(out / name)
+        col.export_anki_package(
+            out_path=path,
+            options=ExportAnkiPackageOptions(with_media=True, legacy=legacy),
+            limit=None,
+        )
+        return path
+
+    pkgs = {"modern": export("modern.apkg", False), "legacy": export("legacy.apkg", True)}
+    col.close()
+    return pkgs
+
+
+@pytest.fixture(params=["modern", "legacy", "import"])
+def rich(request, rich_packages, monkeypatch):
+    if request.param == "import":
+        monkeypatch.setattr(extractor, "_zstd_decompressor", lambda: None)
+        return rich_packages["modern"]
+    return rich_packages[request.param]
+
+
+def _contents(out_dir):
+    return {p.name: p.read_bytes() for p in out_dir.iterdir()}
+
+
+def test_field_names(rich):
+    with extractor.Package(rich) as pkg:
+        assert pkg.has_notes
+        assert pkg.field_names == ["Front", "Back", "Word", "Audio"]
+        assert pkg.audio_names == sorted(RICH_MEDIA)
+
+
+def test_name_after_field(rich, tmp_path):
+    opts = extractor.ExtractOptions(name_field="Front")
+    result = extractor.extract_audio_from_apkg(rich, str(tmp_path), opts)
+    assert {f.original: f.name for f in result.files} == {
+        "a1.mp3": "猫 (neko).mp3",  # first note wins when two notes share a file
+        "a2.mp3": "What Why.mp3",
+        "a3.mp3": "What Why (2).mp3",  # same note, same field: numbered, not lost
+        "a4.mp3": "a4.mp3",  # field holds only the sound tag
+        "a5.mp3": "a5.mp3",  # note type has no Front field
+    }
+    assert _contents(tmp_path) == {
+        "猫 (neko).mp3": b"audio 1",
+        "What Why.mp3": b"audio 2",
+        "What Why (2).mp3": b"audio 3",
+        "a4.mp3": b"audio 4",
+        "a5.mp3": b"audio 5",
+    }
+
+
+def test_name_after_first_field(rich, tmp_path):
+    opts = extractor.ExtractOptions(name_field=extractor.FIRST_FIELD)
+    result = extractor.extract_audio_from_apkg(rich, str(tmp_path), opts)
+    assert {f.original: f.name for f in result.files}["a5.mp3"] == "hello & bye.mp3"
+    assert {f.original: f.name for f in result.files}["a1.mp3"] == "猫 (neko).mp3"
+
+
+def test_csv(rich, tmp_path):
+    import csv
+
+    opts = extractor.ExtractOptions(name_field="Front", write_csv=True)
+    result = extractor.extract_audio_from_apkg(rich, str(tmp_path), opts)
+    assert result.csv_path == str(tmp_path / "audio_notes.csv")
+    with open(result.csv_path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert list(rows[0]) == [
+        "file", "original_file", "note_id", "deck", "note_type", "tags",
+        "Front", "Back", "Word", "Audio",
+    ]
+    by_file = {}
+    for r in rows:
+        by_file.setdefault(r["file"], []).append(r)
+    assert [r["Front"] for r in by_file["猫 (neko).mp3"]] == ["猫 (neko)", "dog"]
+    first = by_file["猫 (neko).mp3"][0]
+    assert (first["deck"], first["note_type"], first["tags"], first["Back"]) == (
+        "Lang::Japanese", "Basic", "animal", "cat",
+    )
+    assert by_file["a5.mp3"][0]["Word"] == "hello & bye"
+    assert by_file["a5.mp3"][0]["Front"] == ""
+    assert len(rows) == 6
+
+
+@pytest.mark.parametrize(
+    "policy,expected_status,expected_files",
+    [
+        ("rename", "renamed", {"a1.mp3": b"old", "a1 (2).mp3": b"audio 1"}),
+        ("skip", "skipped", {"a1.mp3": b"old"}),
+        ("overwrite", "overwritten", {"a1.mp3": b"audio 1"}),
+    ],
+)
+def test_conflicts(rich_packages, tmp_path, policy, expected_status, expected_files):
+    (tmp_path / "a1.mp3").write_bytes(b"old")
+    opts = extractor.ExtractOptions(on_conflict=policy)
+    result = extractor.extract_audio_from_apkg(rich_packages["modern"], str(tmp_path), opts)
+    a1 = next(f for f in result.files if f.original == "a1.mp3")
+    assert a1.status == expected_status
+    assert result.count(expected_status) == 1
+    files = _contents(tmp_path)
+    for name, data in expected_files.items():
+        assert files[name] == data
+    assert len(files) == len(expected_files) + 4
+
+
+def test_rerun_with_skip_writes_nothing_new(rich_packages, tmp_path):
+    opts = extractor.ExtractOptions(name_field="Front", on_conflict="skip")
+    extractor.extract_audio_from_apkg(rich_packages["modern"], str(tmp_path), opts)
+    before = _contents(tmp_path)
+    result = extractor.extract_audio_from_apkg(rich_packages["modern"], str(tmp_path), opts)
+    assert result.count("skipped") == 5
+    assert _contents(tmp_path) == before
+
+
+def test_csv_does_not_replace_existing_csv(rich_packages, tmp_path):
+    (tmp_path / "audio_notes.csv").write_text("mine")
+    opts = extractor.ExtractOptions(write_csv=True)
+    result = extractor.extract_audio_from_apkg(rich_packages["modern"], str(tmp_path), opts)
+    assert result.csv_path == str(tmp_path / "audio_notes (2).csv")
+    assert (tmp_path / "audio_notes.csv").read_text() == "mine"
+
+
+@pytest.mark.parametrize(
+    "html_in,text",
+    [
+        ("a<br>b", "a b"),
+        ("[sound:x.mp3] word", "word"),
+        ("{{c1::Paris::city}} is nice", "Paris is nice"),
+        ("[anki:tts lang=ja_JP]猫[/anki:tts]", "猫"),
+        ("&nbsp;x&lt;y", "x<y"),
+        ("<style>.a{}</style>hi", "hi"),
+    ],
+)
+def test_plain_text(html_in, text):
+    assert extractor.plain_text(html_in) == text
+
+
+@pytest.mark.parametrize(
+    "text,stem",
+    [
+        ('a/b:c*?"<>|', "a b c"),
+        ("ends with dots...", "ends with dots"),
+        ("CON", "CON_"),
+        ("nul.txt", "nul.txt_"),
+        ("", None),
+        ("???", None),
+    ],
+)
+def test_filename_stem(text, stem):
+    assert extractor.filename_stem(text) == stem
+
+
+def test_filename_stem_byte_limit():
+    stem = extractor.filename_stem("猫" * 200)
+    assert len(stem.encode()) <= 150 and set(stem) == {"猫"}

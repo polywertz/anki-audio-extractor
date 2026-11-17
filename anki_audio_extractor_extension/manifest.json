@@ -6,7 +6,7 @@
     "min_point_version": 55,
     "max_point_version": 0,
     "branch_index": 0,
-    "human_version": "1.1.0",
+    "human_version": "1.2.0",
     "homepage": "https://github.com/pwSathira/Anki-Audio-Extractor",
     "author": "Sathira Williams",
     "description": "Extract audio files from Anki packages (.apkg/.colpkg), including the modern format used by current Anki versions. Tested on Anki 26.09.4."
