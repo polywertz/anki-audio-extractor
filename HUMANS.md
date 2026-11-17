@@ -1,6 +1,6 @@
-**Version 1.4.0** · Works with Anki 2.1.55 and newer · Tested on Anki 26.09.4
+**Version 1.5.0** · Works with Anki 2.1.55 and newer · Tested on Anki 26.09.4
 
-Having trouble? Open an issue on GitHub and include a download link to the `.apkg` file that's causing it: https://github.com/pwSathira/Anki-Audio-Extractor/issues
+Having trouble? Open an issue on GitHub and include a download link to the `.apkg` file that's causing it: https://github.com/polywertz/anki-audio-extractor/issues
 
 ---
 
@@ -65,6 +65,7 @@ All three open the same export dialog.
 - `audio_playlist.m3u8`: a playlist in card order. It opens in VLC, phone music players and most other audio apps.
 
 **Safety and convenience**
+- Extracted files keep their original date. From a deck or the Browser, that's the date of the file in your media folder. From a package, it's the date stored in the package: older Anki versions store each file's own date, while current Anki stores the date the package was exported.
 - When a file with the same name already exists, choose to keep both, skip the new one, or overwrite the old one. Files from the same export never overwrite each other.
 - The add-on remembers your choices for next time.
 - The export runs in the background, so Anki stays responsive.
@@ -102,8 +103,8 @@ All three open the same export dialog.
 
 ## Support
 
-- Report a problem or ask for a feature: https://github.com/pwSathira/Anki-Audio-Extractor/issues
-- Source code: https://github.com/pwSathira/Anki-Audio-Extractor
+- Report a problem or ask for a feature: https://github.com/polywertz/anki-audio-extractor/issues
+- Source code: https://github.com/polywertz/anki-audio-extractor
 
 ## License
 

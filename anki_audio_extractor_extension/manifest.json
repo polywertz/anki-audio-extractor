@@ -1,13 +1,13 @@
 {
     "package": "anki_audio_extractor",
     "name": "Anki Audio Extractor",
-    "mod": 1794873600,
+    "mod": 1794886614,
     "conflicts": [],
     "min_point_version": 55,
     "max_point_version": 0,
     "branch_index": 0,
-    "human_version": "1.4.0",
-    "homepage": "https://github.com/pwSathira/Anki-Audio-Extractor",
+    "human_version": "1.5.0",
+    "homepage": "https://github.com/polywertz/anki-audio-extractor",
     "author": "Sathira Williams",
     "description": "Extract audio files from Anki packages (.apkg/.colpkg), from a deck, or from cards selected in the Browser, including the modern package format used by current Anki versions. Tested on Anki 26.09.4."
 }

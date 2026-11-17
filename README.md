@@ -28,6 +28,8 @@ A dialog then lets you choose:
 
 Click **Preview Names…** to see every file's new name, and whether it would be numbered, skipped or replace an existing file, before anything is written.
 
+Extracted files keep their original modification date where one is known. From a deck or the Browser, that's the date of the file in your media folder. From a package, it's the date stored in the package: packages made with Anki before 2.1.50 store each file's own date, while current Anki stores the date the package was exported. Playlists and CSVs are dated when they're saved.
+
 Your choices are remembered for next time. Reading and extracting run in the background. When it's done, **Open Folder** takes you to the files. When exporting from a deck or the Browser, the closing message lists any files the cards refer to that are missing from your media folder.
 
 ## Install from source

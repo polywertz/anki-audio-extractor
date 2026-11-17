@@ -7,10 +7,12 @@ packages in every format the current Anki can produce.
     pytest tests
 """
 
+import calendar
 import importlib.util
 import json
 import os
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -823,3 +825,118 @@ def test_legacy_package_without_collection(packages, tmp_path):
     with extractor.Package(str(pkg)) as p:
         assert not p.has_notes
         assert p.audio_names == AUDIO
+
+
+# --- File modification times ---------------------------------------------------
+
+OLD = 1500000000  # 2017-07-14 02:40:00 UTC, an even number of seconds for zip
+
+
+def _zip_with_times(path, date_time, with_meta):
+    """A legacy-layout package whose audio entry carries the given zip time."""
+    with zipfile.ZipFile(path, "w") as z:
+        if with_meta:
+            z.writestr("meta", b"")
+        z.writestr("collection.anki2", b"")
+        z.writestr("media", json.dumps({"0": "a.mp3"}))
+        z.writestr(zipfile.ZipInfo("0", date_time), b"x")
+
+
+def test_selected_cards_keep_media_folder_times(live_col, tmp_path):
+    col, cards = live_col
+    media = Path(col.media.dir())
+    os.utime(media / "a3.mp3", (OLD, OLD))
+    out = tmp_path / "out"
+    extractor.SelectedCards(col, [cards["dog"]]).extract(str(out))
+    assert os.path.getmtime(out / "a3.mp3") == OLD
+
+
+def test_current_anki_package_times_read_as_utc(tmp_path):
+    # Anki's current exporter writes a "meta" entry and stamps entries in UTC.
+    pkg = tmp_path / "p.apkg"
+    _zip_with_times(pkg, (2017, 7, 14, 2, 40, 0), with_meta=True)
+    extractor.extract_audio_from_apkg(str(pkg), str(tmp_path / "out"))
+    assert os.path.getmtime(tmp_path / "out" / "a.mp3") == OLD
+
+
+def test_old_anki_package_times_read_as_local_time(tmp_path):
+    # Anki before 2.1.50 wrote packages with Python's zipfile: local time, no "meta".
+    pkg = tmp_path / "p.apkg"
+    local = time.localtime(OLD)[:6]
+    _zip_with_times(pkg, local, with_meta=False)
+    extractor.extract_audio_from_apkg(str(pkg), str(tmp_path / "out"))
+    assert os.path.getmtime(tmp_path / "out" / "a.mp3") == OLD
+
+
+def test_zip_without_a_time_leaves_current_time(tmp_path):
+    pkg = tmp_path / "p.apkg"
+    _zip_with_times(pkg, (1980, 1, 1, 0, 0, 0), with_meta=True)
+    before = time.time() - 5
+    extractor.extract_audio_from_apkg(str(pkg), str(tmp_path / "out"))
+    assert os.path.getmtime(tmp_path / "out" / "a.mp3") >= before
+
+
+def test_zip_time_out_of_range():
+    info = zipfile.ZipInfo("0", (2017, 7, 14, 2, 40, 0))
+    info.date_time = (10**10, 1, 1, 0, 0, 0)
+    assert extractor._zip_time(info, utc=False) is None
+    assert extractor._zip_time(info, utc=True) is None
+
+
+@pytest.mark.parametrize("name", ["modern", "legacy", "colpkg"])
+def test_real_packages_get_export_time(packages, tmp_path, name):
+    out = tmp_path / "out"
+    extractor.extract_audio_from_apkg(packages[name], str(out))
+    with zipfile.ZipFile(packages[name]) as z:
+        stamp = calendar.timegm(z.getinfo("media").date_time)
+    for n in AUDIO:
+        assert os.path.getmtime(out / n) == stamp, n
+
+
+def test_import_fallback_gets_export_time(packages, tmp_path, monkeypatch):
+    monkeypatch.setattr(extractor, "_zstd_decompressor", lambda: None)
+    out = tmp_path / "out"
+    extractor.extract_audio_from_apkg(packages["modern"], str(out))
+    with zipfile.ZipFile(packages["modern"]) as z:
+        stamp = calendar.timegm(z.getinfo("collection.anki21b").date_time)
+    assert {os.path.getmtime(out / n) for n in AUDIO} == {stamp}
+
+
+def test_skipped_file_keeps_its_own_time(tmp_path):
+    pkg = tmp_path / "p.apkg"
+    _zip_with_times(pkg, (2017, 7, 14, 2, 40, 0), with_meta=True)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "a.mp3").write_bytes(b"mine")
+    os.utime(out / "a.mp3", (OLD + 100, OLD + 100))
+    extractor.extract_audio_from_apkg(
+        str(pkg), str(out), extractor.ExtractOptions(on_conflict=extractor.SKIP)
+    )
+    assert os.path.getmtime(out / "a.mp3") == OLD + 100
+
+
+def test_time_not_settable_still_extracts(tmp_path, monkeypatch):
+    pkg = tmp_path / "p.apkg"
+    _zip_with_times(pkg, (2017, 7, 14, 2, 40, 0), with_meta=True)
+
+    def refuse(*args, **kwargs):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(extractor.os, "utime", refuse)
+    out = tmp_path / "out"
+    assert extractor.extract_audio_from_apkg(str(pkg), str(out)).names == ["a.mp3"]
+    assert (out / "a.mp3").read_bytes() == b"x"
+
+
+def test_import_fallback_without_a_time(packages, tmp_path, monkeypatch):
+    monkeypatch.setattr(extractor, "_zstd_decompressor", lambda: None)
+    pkg = tmp_path / "undated.apkg"
+    with zipfile.ZipFile(packages["modern"]) as src, zipfile.ZipFile(pkg, "w") as dst:
+        for info in src.infolist():
+            data = src.read(info)
+            info.date_time = (1980, 1, 1, 0, 0, 0)
+            dst.writestr(info, data)
+    before = time.time() - 5
+    out = tmp_path / "out"
+    extractor.extract_audio_from_apkg(str(pkg), str(out))
+    assert all(os.path.getmtime(out / n) >= before for n in AUDIO)
