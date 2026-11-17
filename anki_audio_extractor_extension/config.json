@@ -1,8 +1,11 @@
 {
     "last_output_dir": "",
     "name_files_after": "original",
+    "name_pattern": "",
     "if_file_exists": "rename",
     "write_csv": false,
+    "write_playlist": false,
     "number_prefix": false,
+    "subfolder_per_deck": false,
     "excluded_audio_fields": []
 }

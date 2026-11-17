@@ -49,6 +49,7 @@ SKIPPED = "skipped"
 OVERWRITTEN = "overwritten"
 
 CSV_NAME = "audio_notes.csv"
+PLAYLIST_NAME = "audio_playlist.m3u8"
 _MAX_STEM_BYTES = 150  # leaves room for a number prefix and " (123).ext" under 255 bytes
 
 
@@ -67,12 +68,18 @@ class ExtractOptions:
     # Only extract audio played from these fields. None means every field, plus
     # audio in a package that no note plays.
     audio_fields: Optional[frozenset[str]] = None
+    # Name files with a pattern such as "{Front} - {Back}" instead of one
+    # field. Takes precedence over name_field when set.
+    name_pattern: Optional[str] = None
+    # Put each file in a folder named after its note's deck ("Lang/Japanese/").
+    subfolder_per_deck: bool = False
+    write_playlist: bool = False
 
 
 @dataclass
 class ExtractedFile:
     original: str  # name in the package / media folder
-    name: str  # name in the output folder
+    name: str  # path in the output folder, "/"-separated when in a deck subfolder
     status: str
     number: Optional[int] = None  # position of its note in card order
 
@@ -81,6 +88,7 @@ class ExtractedFile:
 class ExtractionResult:
     files: list[ExtractedFile] = field(default_factory=list)
     csv_path: Optional[str] = None
+    playlist_path: Optional[str] = None
     missing: list[str] = field(default_factory=list)  # referenced but not in the media folder
 
     @property
@@ -182,6 +190,89 @@ def filename_stem(text: str) -> Optional[str]:
     return s
 
 
+_PATTERN_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def pattern_fields(pattern: str) -> list[str]:
+    """Field names used in a naming pattern such as ``"{Front} - {Back}"``."""
+    return [m.strip() for m in _PATTERN_RE.findall(pattern)]
+
+
+_OPENING = "([（【「『"
+_CLOSING = ")]）】」』"
+
+
+def render_pattern(pattern: str, fields: dict[str, str]) -> str:
+    """Fill ``pattern`` with plain-text field values.
+
+    Brackets right next to a field belong to it, and an empty field is left
+    out together with its brackets and the separator before it. With
+    "{Word} ({Reading}) - {Meaning}", a note without a reading gives
+    "猫 - cat", and one without a meaning gives "猫 (neko)". Returns "" if
+    every field is empty.
+    """
+    parts = _PATTERN_RE.split(pattern)  # literal, field, literal, field, ..., literal
+    literals, names = parts[0::2], parts[1::2]
+    values = [plain_text(fields.get(n.strip(), "")) for n in names]
+    if not any(values):
+        return ""
+
+    # Split each literal into: closing brackets of the field before it, the
+    # separator, and opening brackets of the field after it.
+    split = []
+    for lit in literals:
+        tail = len(lit) - len(lit.lstrip(_CLOSING))
+        head = len(lit.rstrip(_OPENING))  # never before tail: rstrip stops at a closing bracket
+        split.append((lit[:tail], lit[tail:head], lit[head:]))
+    split[0] = ("", split[0][0] + split[0][1], split[0][2])  # text before the first field
+    split[-1] = (split[-1][0], split[-1][1] + split[-1][2], "")  # text after the last one
+
+    # Build (text, from_pattern) pieces so cleanup only touches the pattern's own text.
+    pieces = [(split[0][1], True)]
+    first = True
+    for i, value in enumerate(values):
+        if not value:
+            continue
+        if not first:
+            # Separator: the text between this field and the kept field before it.
+            pieces.append((split[i][1], True))
+        pieces += [(split[i][2], True), (value, False), (split[i + 1][0], True)]
+        first = False
+    pieces.append((split[-1][1], True))
+    if not all(values):
+        pieces = _drop_unmatched_brackets(pieces)
+    return " ".join("".join(text for text, _ in pieces).split())
+
+
+def _drop_unmatched_brackets(pieces: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
+    """Remove pattern brackets left without a partner, e.g. by a dropped field
+    in "{A} ({B}, {C})". Brackets inside field values are left alone."""
+    chars = [(ch, n) for n, (text, own) in enumerate(pieces) if own for ch in text]
+    positions = [(n, j) for n, (text, own) in enumerate(pieces) if own for j in range(len(text))]
+    drop = set()
+    stack: list[int] = []
+    for k, (ch, _) in enumerate(chars):
+        if ch in _OPENING:
+            stack.append(k)
+        elif ch in _CLOSING:
+            if stack and _OPENING.index(chars[stack[-1]][0]) == _CLOSING.index(ch):
+                stack.pop()
+            else:
+                drop.add(k)
+    drop.update(stack)
+    dropped = {positions[k] for k in drop}
+    return [
+        ("".join(ch for j, ch in enumerate(text) if (n, j) not in dropped), own)
+        for n, (text, own) in enumerate(pieces)
+    ]
+
+
+def _deck_folder(deck: str) -> str:
+    """Relative folder for a deck: "Lang::Japanese" -> "Lang/Japanese"."""
+    parts = [filename_stem(p) or "_" for p in deck.split("::") if p.strip()]
+    return "/".join(parts)
+
+
 # --- Reading notes ------------------------------------------------------------
 
 
@@ -224,12 +315,38 @@ def _read_notes(col: Any, card_rows: Iterable[tuple[int, int]], only_listed: boo
     return notes
 
 
+_STUDY_ORDER_SQL = (
+    "select id, nid, did, (case when odid then odid else did end), type,"
+    " (case when odid then odue else due end), ord from cards"
+)
+
+
+def _study_order(col: Any, where: str = "") -> list[tuple[int, int, int]]:
+    """Cards in study order: by deck, then new-card position, then creation.
+
+    Cards in a filtered deck count as being in their home deck. Returns
+    (card id, note id, deck id) tuples.
+    """
+    rows = col.db.all(_STUDY_ORDER_SQL + (f" where {where}" if where else ""))
+    names: dict[int, str] = {}
+    for r in rows:
+        if r[3] not in names:
+            names[r[3]] = col.decks.name(r[3])
+    rows.sort(key=lambda r: (names[r[3]], r[4] != 0, r[5] if r[4] == 0 else 0, r[1], r[6]))
+    return [(r[0], r[1], r[3]) for r in rows]
+
+
 def _package_card_order(col: Any) -> list[tuple[int, int]]:
-    """Cards of a package in study order: by deck, then new-card position, then creation."""
-    decks = {did: col.decks.name(did) for did in {r[0] for r in col.db.all("select distinct did from cards")}}
-    rows = col.db.all("select nid, did, type, due, ord, id from cards")
-    rows.sort(key=lambda r: (decks.get(r[1], ""), r[2] != 0, r[3] if r[2] == 0 else 0, r[0], r[4]))
-    return [(r[0], r[1]) for r in rows]
+    return [(nid, did) for _, nid, did in _study_order(col)]
+
+
+def deck_card_ids(col: Any, deck_id: int) -> list[int]:
+    """Card ids in a deck and its subdecks (including cards moved to a filtered
+    deck), in study order."""
+    from anki.utils import ids2str
+
+    dids = ids2str(col.decks.deck_and_child_ids(deck_id))
+    return [cid for cid, _, _ in _study_order(col, f"did in {dids} or odid in {dids}")]
 
 
 # --- Audio sources ------------------------------------------------------------
@@ -286,31 +403,34 @@ class AudioSource:
                     seen.setdefault(fname, None)
         return [f for f in self.field_names if f in seen]
 
+    def preview(self, output_dir: str, options: Optional[ExtractOptions] = None) -> list[ExtractedFile]:
+        """What extract() would do, without writing anything."""
+        _, files, _ = self._assign(output_dir, options or ExtractOptions())
+        return files
+
     def extract(self, output_dir: str, options: Optional[ExtractOptions] = None) -> ExtractionResult:
         options = options or ExtractOptions()
-        if options.on_conflict not in (RENAME, SKIP, OVERWRITE):
-            raise ValueError(f"Unknown conflict policy: {options.on_conflict}")
+        plan, files, used = self._assign(output_dir, options)
         os.makedirs(output_dir, exist_ok=True)
-
-        plan = self._plan(options.audio_fields)
-        width = max(4, len(str(max((p.number for p in plan), default=0))))
-        result = ExtractionResult(missing=list(self.missing))
-        used: set[str] = set()
-        for item in plan:
-            desired = self._desired_name(item, options.name_field)
-            if options.number_prefix:
-                desired = f"{item.number:0{width}d}_{desired}"
-            name, status = _resolve(output_dir, desired, used, options.on_conflict)
-            if status != SKIPPED:
-                with open(os.path.join(output_dir, name), "wb") as f:
+        result = ExtractionResult(files=files, missing=list(self.missing))
+        for item, out in zip(plan, files):
+            if out.status != SKIPPED:
+                path = os.path.join(output_dir, *out.name.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
                     f.write(item.load())
-            result.files.append(ExtractedFile(item.original, name, status, item.number))
 
+        # Lists always go in the top folder; they never skip, so they stay current.
+        list_policy = OVERWRITE if options.on_conflict == OVERWRITE else RENAME
+        root_used = used.setdefault("", set())
         if options.write_csv and self.has_notes:
-            csv_policy = OVERWRITE if options.on_conflict == OVERWRITE else RENAME
-            csv_name, _ = _resolve(output_dir, CSV_NAME, used, csv_policy)
+            csv_name, _ = _resolve(output_dir, CSV_NAME, root_used, list_policy)
             result.csv_path = os.path.join(output_dir, csv_name)
-            self._write_csv(result.csv_path, plan, result.files)
+            self._write_csv(result.csv_path, plan, files)
+        if options.write_playlist:
+            pl_name, _ = _resolve(output_dir, PLAYLIST_NAME, root_used, list_policy)
+            result.playlist_path = os.path.join(output_dir, pl_name)
+            self._write_playlist(result.playlist_path, plan, files)
         return result
 
     def close(self) -> None:
@@ -359,18 +479,54 @@ class AudioSource:
                 planned[name] = _Planned(name, self._media[name], [], number)
         return list(planned.values())
 
-    def _desired_name(self, item: _Planned, name_field: Optional[str]) -> str:
-        if not name_field or not item.users:
+    def _assign(
+        self, output_dir: str, options: ExtractOptions
+    ) -> tuple[list[_Planned], list[ExtractedFile], dict[str, set[str]]]:
+        """Plan the extraction and pick every output name and status."""
+        if options.on_conflict not in (RENAME, SKIP, OVERWRITE):
+            raise ValueError(f"Unknown conflict policy: {options.on_conflict}")
+        plan = self._plan(options.audio_fields)
+        width = max(4, len(str(max((p.number for p in plan), default=0))))
+        used: dict[str, set[str]] = {}  # folder -> lower-cased names taken in it
+        files = []
+        for item in plan:
+            desired = self._desired_name(item, options)
+            if options.number_prefix:
+                desired = f"{item.number:0{width}d}_{desired}"
+            folder = ""
+            if options.subfolder_per_deck and item.users:
+                folder = _deck_folder(item.users[0].deck)
+            target = os.path.join(output_dir, *folder.split("/")) if folder else output_dir
+            name, status = _resolve(target, desired, used.setdefault(folder, set()), options.on_conflict)
+            rel = f"{folder}/{name}" if folder else name
+            files.append(ExtractedFile(item.original, rel, status, item.number))
+        return plan, files, used
+
+    def _desired_name(self, item: _Planned, options: ExtractOptions) -> str:
+        if not item.users or not (options.name_pattern or options.name_field):
             return item.original
         note = item.users[0]  # the first note in card order that plays this file
-        if name_field == FIRST_FIELD:
-            value = next(iter(note.fields.values()), "")
+        if options.name_pattern:
+            text = render_pattern(options.name_pattern, note.fields)
+        elif options.name_field == FIRST_FIELD:
+            text = plain_text(next(iter(note.fields.values()), ""))
         else:
-            value = note.fields.get(name_field, "")
-        stem = filename_stem(plain_text(value))
+            text = plain_text(note.fields.get(options.name_field, ""))
+        stem = filename_stem(text)
         if not stem:
             return item.original
         return stem + os.path.splitext(item.original)[1]
+
+    def _write_playlist(self, path: str, plan: list[_Planned], files: list[ExtractedFile]) -> None:
+        """An extended M3U playlist in card order, titled after each note's first field."""
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("#EXTM3U\n")
+            for item, out in zip(plan, files):
+                title = ""
+                if item.users:
+                    title = plain_text(next(iter(item.users[0].fields.values()), ""))
+                title = title or os.path.splitext(os.path.basename(out.name))[0]
+                f.write(f"#EXTINF:-1,{title}\n{out.name}\n")
 
     def _write_csv(self, path: str, plan: list[_Planned], files: list[ExtractedFile]) -> None:
         field_cols = self.field_names
@@ -401,10 +557,12 @@ class SelectedCards(AudioSource):
         super().__init__()
         from anki.utils import ids2str
 
+        # A card in a filtered deck counts as being in its home deck.
         by_card = {
             cid: (nid, did)
             for cid, nid, did in col.db.all(
-                f"select id, nid, did from cards where id in {ids2str(card_ids)}"
+                "select id, nid, (case when odid then odid else did end) from cards"
+                f" where id in {ids2str(card_ids)}"
             )
         }
         rows = [by_card[c] for c in card_ids if c in by_card]
