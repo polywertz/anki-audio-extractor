@@ -1,0 +1,6 @@
+[run]
+source = anki_audio_extractor_extension
+branch = true
+
+[report]
+show_missing = true

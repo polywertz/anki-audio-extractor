@@ -6,3 +6,5 @@ venv/
 *.ankiaddon
 meta.json
 .DS_Store
+.coverage
+htmlcov/

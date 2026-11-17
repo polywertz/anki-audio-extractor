@@ -514,3 +514,312 @@ def test_selected_cards_no_audio(live_col, tmp_path):
     col, cards = live_col
     src = extractor.SelectedCards(col, [cards["pic"]])
     assert src.audio_names == [] and src.missing == []
+
+
+# --- Patterns, deck folders, playlists, preview and deck export ----------------
+
+
+@pytest.mark.parametrize(
+    "pattern,fields,expected",
+    [
+        ("{Front} - {Back}", {"Front": "cat", "Back": "neko"}, "cat - neko"),
+        ("{Front} - {Back}", {"Front": "cat", "Back": ""}, "cat"),
+        ("{Front} - {Back}", {"Front": "", "Back": "neko"}, "neko"),
+        ("{Word} ({Reading})", {"Word": "猫", "Reading": ""}, "猫"),
+        ("{Word} ({Reading})", {"Word": "", "Reading": "neko"}, "(neko)"),  # brackets go with their field
+        ("{Word} ({Reading})", {"Word": "猫", "Reading": "neko"}, "猫 (neko)"),
+        ("{A} ({B}) - {C}", {"A": "猫", "B": "", "C": "cat"}, "猫 - cat"),
+        ("{A} [{B}] ({C})", {"A": "x", "B": "y", "C": ""}, "x [y]"),
+        ("({A}) {B}", {"A": "x", "B": ""}, "(x)"),
+        ("{A}「{B}」", {"A": "猫", "B": ""}, "猫"),
+        ("{A})({B}", {"A": "a", "B": "b"}, "a)(b"),  # nothing dropped: pattern kept as is
+        ("{A} ({B}, {C})", {"A": "x", "B": "", "C": "z"}, "x, z"),  # unmatched "(" removed
+        ("{A} ({B})", {"A": "smile :)", "B": ""}, "smile :)"),  # field text never trimmed
+        ("{A} - {B} - {C}", {"A": "x", "B": "", "C": "z"}, "x - z"),
+        ("{A}.{B}", {"A": "a", "B": ""}, "a"),
+        ("{ Front }", {"Front": "-ing"}, "-ing"),
+        ("Word {Front}", {"Front": "<b>cat</b>[sound:a.mp3]"}, "Word cat"),
+        ("{Front} - {Back}", {}, ""),
+    ],
+)
+def test_render_pattern(pattern, fields, expected):
+    assert extractor.render_pattern(pattern, fields) == expected
+
+
+def test_pattern_fields():
+    assert extractor.pattern_fields("{Front} - { Back }") == ["Front", "Back"]
+
+
+def test_name_pattern(rich, tmp_path):
+    opts = extractor.ExtractOptions(name_pattern="{Word}{Front} - {Back}", name_field="Back")
+    result = extractor.extract_audio_from_apkg(rich, str(tmp_path), opts)
+    assert {f.original: f.name for f in result.files} == {
+        "a1.mp3": "猫 (neko) - cat.mp3",
+        "a2.mp3": "What Why.mp3",
+        "a3.mp3": "What Why (2).mp3",
+        "a4.mp3": "a4.mp3",  # the only text is the sound tag
+        "a5.mp3": "hello & bye.mp3",
+    }
+
+
+def test_subfolder_per_deck(live_col, tmp_path):
+    col, cards = live_col
+    other = col.decks.id("Other")
+    col.set_deck([cards["fox"]], other)
+    src = extractor.SelectedCards(col, list(cards.values()))
+    out = tmp_path / "out"
+    opts = extractor.ExtractOptions(subfolder_per_deck=True, name_field="Front", write_csv=True)
+    result = src.extract(str(out), opts)
+    assert result.names == ["Mine/Sub/cat.mp3", "Mine/Sub/cat (2).mp3", "Mine/Sub/dog.mp3", "Other/fox.mp3"]
+    assert (out / "Mine" / "Sub" / "dog.mp3").read_bytes() == b"audio 3"
+    assert (out / "Other" / "fox.mp3").read_bytes() == b"audio 4"
+    assert (out / "audio_notes.csv").exists()
+
+
+def test_same_name_in_different_deck_folders_not_numbered(live_col, tmp_path):
+    col, cards = live_col
+    col.set_deck([cards["fox"]], col.decks.id("Other"))
+    note = col.get_card(cards["fox"]).note()
+    note["Front"] = "cat"
+    col.update_note(note)
+    src = extractor.SelectedCards(col, [cards["cat"], cards["fox"]])
+    opts = extractor.ExtractOptions(subfolder_per_deck=True, name_field="Front")
+    names = src.extract(str(tmp_path / "out"), opts).names
+    assert names == ["Mine/Sub/cat.mp3", "Mine/Sub/cat (2).mp3", "Other/cat.mp3"]
+
+
+def test_playlist(rich, tmp_path):
+    opts = extractor.ExtractOptions(write_playlist=True, number_prefix=True, name_field="Front")
+    result = extractor.extract_audio_from_apkg(rich, str(tmp_path), opts)
+    assert result.playlist_path == str(tmp_path / "audio_playlist.m3u8")
+    lines = (tmp_path / "audio_playlist.m3u8").read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "#EXTM3U"
+    assert lines[1:] == [
+        "#EXTINF:-1,猫 (neko)", "0001_猫 (neko).mp3",
+        "#EXTINF:-1,What? / Why?", "0002_What Why.mp3",  # titles keep the text as is
+        "#EXTINF:-1,What? / Why?", "0002_What Why (2).mp3",
+        "#EXTINF:-1,0003_a4", "0003_a4.mp3",  # first field is only a sound tag
+        "#EXTINF:-1,hello & bye", "0004_a5.mp3",
+    ]
+
+
+def test_playlist_lists_subfolder_paths(live_col, tmp_path):
+    col, cards = live_col
+    src = extractor.SelectedCards(col, [cards["cat"]])
+    opts = extractor.ExtractOptions(write_playlist=True, subfolder_per_deck=True)
+    src.extract(str(tmp_path), opts)
+    lines = (tmp_path / "audio_playlist.m3u8").read_text(encoding="utf-8").splitlines()
+    assert lines[2::2] == ["Mine/Sub/a1.mp3", "Mine/Sub/a2.mp3"]
+
+
+def test_playlist_never_skipped(rich_packages, tmp_path):
+    (tmp_path / "audio_playlist.m3u8").write_text("old")
+    opts = extractor.ExtractOptions(write_playlist=True, on_conflict="skip")
+    result = extractor.extract_audio_from_apkg(rich_packages["modern"], str(tmp_path), opts)
+    assert result.playlist_path == str(tmp_path / "audio_playlist (2).m3u8")
+
+
+def test_preview_writes_nothing(rich_packages, tmp_path):
+    (tmp_path / "a1.mp3").write_bytes(b"old")
+    with extractor.Package(rich_packages["modern"]) as pkg:
+        opts = extractor.ExtractOptions(write_csv=True, write_playlist=True)
+        files = pkg.preview(str(tmp_path / "new"), opts)
+        assert len(files) == 5 and not (tmp_path / "new").exists()
+        files = pkg.preview(str(tmp_path), extractor.ExtractOptions(on_conflict="skip"))
+        assert os.listdir(tmp_path) == ["a1.mp3"]
+        assert [(f.name, f.status) for f in files][0] == ("a1.mp3", "skipped")
+        # Preview and extraction agree.
+        result = pkg.extract(str(tmp_path), extractor.ExtractOptions(on_conflict="skip"))
+        assert [(f.name, f.status) for f in result.files] == [(f.name, f.status) for f in files]
+
+
+def test_deck_card_ids(live_col, tmp_path):
+    col, cards = live_col
+    parent = col.decks.id("Mine")
+    other = col.decks.id("Other")
+    col.set_deck([cards["fox"]], other)
+    # Subdecks are included; other decks are not.
+    ids = extractor.deck_card_ids(col, parent)
+    assert set(ids) == {cards["cat"], cards["dog"], cards["pic"]}
+    assert extractor.deck_card_ids(col, other) == [cards["fox"]]
+    # Cards moved into a filtered deck still count as part of their home deck.
+    col.decks.new_filtered("Cram")
+    filtered = col.decks.by_name("Cram")
+    filtered["terms"][0][0] = "deck:Mine::Sub"
+    col.decks.save(filtered)
+    col.sched.rebuild_filtered_deck(filtered["id"])
+    assert col.db.scalar("select count() from cards where odid != 0") == 3
+    assert set(extractor.deck_card_ids(col, parent)) == {cards["cat"], cards["dog"], cards["pic"]}
+    src = extractor.SelectedCards(col, extractor.deck_card_ids(col, parent))
+    result = src.extract(str(tmp_path / "out"), extractor.ExtractOptions(subfolder_per_deck=True))
+    assert all(n.startswith("Mine/Sub/") for n in result.names)
+
+
+def test_deck_card_ids_new_card_order(tmp_path):
+    col = Collection(str(tmp_path / "c.anki2"))
+    did = col.decks.id("D")
+    cids = []
+    for word in ("one", "two", "three"):
+        note = col.new_note(col.models.by_name("Basic"))
+        note["Front"] = word
+        col.add_note(note, did)
+        cids.append(note.card_ids()[0])
+    col.sched.reposition_new_cards(list(reversed(cids)), 1, 1, False, False)
+    assert extractor.deck_card_ids(col, did) == list(reversed(cids))
+    col.close()
+
+
+# --- Edge cases and fallbacks ---------------------------------------------------
+
+
+def test_zstd_falls_back_to_zstandard(monkeypatch):
+    zstandard = pytest.importorskip("zstandard")
+    monkeypatch.setitem(sys.modules, "compression.zstd", None)  # as on Python < 3.14
+    monkeypatch.setitem(sys.modules, "compression", None)
+    decompress = extractor._zstd_decompressor()
+    assert decompress is not None
+    assert decompress(zstandard.ZstdCompressor().compress(b"hello" * 100)) == b"hello" * 100
+
+
+def test_zstd_unavailable(monkeypatch):
+    for mod in ("compression", "compression.zstd", "zstandard"):
+        monkeypatch.setitem(sys.modules, mod, None)
+    assert extractor._zstd_decompressor() is None
+
+
+def test_modern_package_with_real_zstandard(packages, tmp_path, monkeypatch):
+    pytest.importorskip("zstandard")
+    monkeypatch.setitem(sys.modules, "compression.zstd", None)
+    monkeypatch.setitem(sys.modules, "compression", None)
+    result = extractor.extract_audio_from_apkg(packages["modern"], str(tmp_path))
+    _check_output(tmp_path, result.names)
+
+
+def _legacy_with(tmp_path, packages, media_json=None, collection=None, extra=()):
+    """Copy of the legacy package with a replaced media list or collection."""
+    pkg = tmp_path / "edited.apkg"
+    with zipfile.ZipFile(packages["legacy"]) as src, zipfile.ZipFile(pkg, "w") as dst:
+        for info in src.infolist():
+            data = src.read(info)
+            if info.filename == "media" and media_json is not None:
+                data = media_json if isinstance(media_json, bytes) else json.dumps(
+                    media_json(json.loads(data))
+                ).encode()
+            elif info.filename.startswith("collection.anki2") and collection is not None:
+                data = collection
+            dst.writestr(info.filename, data)
+        for name, data in extra:
+            dst.writestr(name, data)
+    return str(pkg)
+
+
+def test_corrupt_media_list(packages, tmp_path):
+    pkg = _legacy_with(tmp_path, packages, media_json=b"{not json")
+    with pytest.raises(extractor.ExtractionError, match="Could not read the media list"):
+        extractor.Package(pkg)
+
+
+@pytest.mark.parametrize("bad_name", ["..", "dir/", ""])
+def test_unusable_media_names_skipped(packages, tmp_path, bad_name):
+    pkg = _legacy_with(
+        tmp_path, packages, media_json=lambda m: {**m, "99": bad_name}, extra=[("99", b"x")]
+    )
+    names = extractor.extract_audio_from_apkg(pkg, str(tmp_path / "out")).names
+    assert sorted(names) == AUDIO
+
+
+def test_unreadable_collection_still_extracts(packages, tmp_path):
+    pkg = _legacy_with(tmp_path, packages, collection=b"not a database")
+    with extractor.Package(pkg) as p:
+        assert not p.has_notes
+        assert p.field_names == [] and p.audio_field_names == []
+        opts = extractor.ExtractOptions(
+            name_field="Front", number_prefix=True, write_csv=True, subfolder_per_deck=True
+        )
+        result = p.extract(str(tmp_path / "out"), opts)
+    # Original names, numbered in name order, no CSV.
+    assert [n.split("_", 1)[1] for n in result.names] == AUDIO
+    assert result.csv_path is None
+
+
+def test_notes_that_fail_to_load(packages, tmp_path, monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("odd schema")
+
+    monkeypatch.setattr(extractor, "_read_notes", broken)
+    with extractor.Package(packages["legacy"]) as p:
+        assert not p.has_notes
+        assert sorted(p.extract(str(tmp_path), extractor.ExtractOptions(name_field="Front")).names) == AUDIO
+
+
+def test_close_survives_collection_close_error(packages):
+    p = extractor.Package(packages["legacy"])
+
+    class Broken:
+        def close(self, downgrade=False):
+            raise RuntimeError("already closed")
+
+    p._col = Broken()
+    p.close()
+    assert p._col is None
+
+
+def test_unknown_conflict_policy(rich_packages, tmp_path):
+    with extractor.Package(rich_packages["modern"]) as p:
+        with pytest.raises(ValueError, match="conflict policy"):
+            p.extract(str(tmp_path), extractor.ExtractOptions(on_conflict="ask"))
+
+
+def test_csv_lists_audio_no_note_plays(packages, tmp_path):
+    import csv
+
+    pkg = _legacy_with(
+        tmp_path, packages, media_json=lambda m: {**m, "99": "orphan.mp3"}, extra=[("99", b"o")]
+    )
+    result = extractor.extract_audio_from_apkg(
+        pkg, str(tmp_path / "out"), extractor.ExtractOptions(write_csv=True)
+    )
+    with open(result.csv_path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    orphan = [r for r in rows if r["file"] == "orphan.mp3"]
+    assert len(orphan) == 1
+    assert orphan[0]["note_id"] == orphan[0]["deck"] == orphan[0]["Front"] == ""
+
+
+def test_numbering_continues_past_two(rich_packages, tmp_path):
+    (tmp_path / "a1.mp3").write_bytes(b"old")
+    (tmp_path / "a1 (2).mp3").write_bytes(b"old")
+    result = extractor.extract_audio_from_apkg(rich_packages["modern"], str(tmp_path))
+    assert "a1 (3).mp3" in result.names
+    assert (tmp_path / "a1 (3).mp3").read_bytes() == b"audio 1"
+
+
+def test_selected_cards_skips_repeats_and_non_audio(live_col, tmp_path):
+    col, cards = live_col
+    note = col.get_card(cards["cat"]).note()
+    note["Front"] = "cat [sound:a1.mp3] [sound:clip.mp4] [sound:../a2.mp3]"
+    col.update_note(note)
+    with extractor.SelectedCards(col, [cards["cat"]]) as src:
+        assert src.audio_names == ["a1.mp3", "a2.mp3"]
+        assert src.missing == []
+
+
+def test_playlist_titles_audio_no_note_plays(packages, tmp_path):
+    pkg = _legacy_with(
+        tmp_path, packages, media_json=lambda m: {**m, "99": "orphan.mp3"}, extra=[("99", b"o")]
+    )
+    out = tmp_path / "out"
+    extractor.extract_audio_from_apkg(pkg, str(out), extractor.ExtractOptions(write_playlist=True))
+    lines = (out / "audio_playlist.m3u8").read_text(encoding="utf-8").splitlines()
+    assert lines[-2:] == ["#EXTINF:-1,orphan", "orphan.mp3"]
+
+
+def test_legacy_package_without_collection(packages, tmp_path):
+    pkg = tmp_path / "nocol.apkg"
+    with zipfile.ZipFile(packages["legacy"]) as src, zipfile.ZipFile(pkg, "w") as dst:
+        for info in src.infolist():
+            if not info.filename.startswith("collection"):
+                dst.writestr(info.filename, src.read(info))
+    with extractor.Package(str(pkg)) as p:
+        assert not p.has_notes
+        assert p.audio_names == AUDIO
