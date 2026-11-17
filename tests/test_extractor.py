@@ -297,7 +297,7 @@ def test_csv(rich, tmp_path):
     with open(result.csv_path, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
     assert list(rows[0]) == [
-        "file", "original_file", "note_id", "deck", "note_type", "tags",
+        "number", "file", "original_file", "note_id", "deck", "note_type", "tags",
         "Front", "Back", "Word", "Audio",
     ]
     by_file = {}
@@ -384,3 +384,133 @@ def test_filename_stem(text, stem):
 def test_filename_stem_byte_limit():
     stem = extractor.filename_stem("猫" * 200)
     assert len(stem.encode()) <= 150 and set(stem) == {"猫"}
+
+
+# --- Card order, number prefixes, field filter, selected cards ----------------
+
+
+def test_number_prefix(rich, tmp_path):
+    opts = extractor.ExtractOptions(number_prefix=True)
+    result = extractor.extract_audio_from_apkg(rich, str(tmp_path), opts)
+    # Card order; files on the same note share a number; note 4 only replays a1.
+    assert [f.name for f in result.files] == [
+        "0001_a1.mp3", "0002_a2.mp3", "0002_a3.mp3", "0003_a4.mp3", "0004_a5.mp3",
+    ]
+    assert _contents(tmp_path)["0002_a3.mp3"] == b"audio 3"
+
+
+def test_number_prefix_with_field_names(rich, tmp_path):
+    opts = extractor.ExtractOptions(name_field="Front", number_prefix=True)
+    names = extractor.extract_audio_from_apkg(rich, str(tmp_path), opts).names
+    assert names[:3] == ["0001_猫 (neko).mp3", "0002_What Why.mp3", "0002_What Why (2).mp3"]
+
+
+def test_package_follows_new_card_position(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    col = Collection(str(src / "c.anki2"))
+    cids = []
+    for word in ("one", "two", "three"):
+        (src / f"{word}.mp3").write_bytes(word.encode())
+        col.media.add_file(str(src / f"{word}.mp3"))
+        note = col.new_note(col.models.by_name("Basic"))
+        note["Front"], note["Back"] = word, f"[sound:{word}.mp3]"
+        col.add_note(note, col.decks.id("Default"))
+        cids.append(note.card_ids()[0])
+    col.sched.reposition_new_cards(list(reversed(cids)), 1, 1, False, False)
+    pkg = str(tmp_path / "p.apkg")
+    col.export_anki_package(
+        out_path=pkg, options=ExportAnkiPackageOptions(with_scheduling=True, with_media=True), limit=None
+    )
+    col.close()
+    opts = extractor.ExtractOptions(number_prefix=True, name_field="Front")
+    names = extractor.extract_audio_from_apkg(pkg, str(tmp_path / "out"), opts).names
+    assert names == ["0001_three.mp3", "0002_two.mp3", "0003_one.mp3"]
+
+
+def test_orphans_numbered_last(packages, tmp_path):
+    pkg = tmp_path / "orphan.apkg"
+    with zipfile.ZipFile(packages["legacy"]) as src, zipfile.ZipFile(pkg, "w") as dst:
+        for info in src.infolist():
+            if info.filename == "media":
+                m = json.loads(src.read("media"))
+                m["99"] = "orphan.mp3"
+                dst.writestr("media", json.dumps(m))
+            else:
+                dst.writestr(info, src.read(info))
+        dst.writestr("99", b"orphan")
+    opts = extractor.ExtractOptions(number_prefix=True)
+    names = extractor.extract_audio_from_apkg(str(pkg), str(tmp_path / "out"), opts).names
+    assert names[-1] == "0002_orphan.mp3"
+    assert all(n.startswith("0001_") for n in names[:-1])
+
+
+def test_audio_field_filter(rich, tmp_path):
+    with extractor.Package(rich) as pkg:
+        assert pkg.audio_field_names == ["Front", "Back", "Audio"]
+        assert pkg.audio_count({"Back"}) == 3
+        assert pkg.audio_count() == 5
+        opts = extractor.ExtractOptions(audio_fields=frozenset({"Back", "Audio"}), number_prefix=True)
+        result = pkg.extract(str(tmp_path), opts)
+    assert sorted(_contents(tmp_path)) == [
+        "0001_a1.mp3", "0002_a2.mp3", "0002_a3.mp3", "0003_a5.mp3",
+    ]
+
+
+@pytest.fixture
+def live_col(tmp_path):
+    """A collection like the user's own: notes, a media folder, one missing file."""
+    (tmp_path / "live").mkdir()
+    col = Collection(str(tmp_path / "live" / "c.anki2"))
+    for name, data in RICH_MEDIA.items():
+        (tmp_path / name).write_bytes(data)
+        col.media.add_file(str(tmp_path / name))
+    basic = col.models.by_name("Basic")
+    cards = {}
+    for key, front, back in [
+        ("cat", "cat", "[sound:a1.mp3][sound:a2.mp3]"),
+        ("dog", "dog [sound:a3.mp3]", "[sound:gone.mp3]"),
+        ("pic", "picture", '<img src="x.png">'),
+        ("fox", "fox", "[sound:a4.mp3]"),
+    ]:
+        note = col.new_note(basic)
+        note["Front"], note["Back"] = front, back
+        col.add_note(note, col.decks.id("Mine::Sub"))
+        cards[key] = note.card_ids()[0]
+    yield col, cards
+    col.close()
+
+
+def test_selected_cards_in_selection_order(live_col, tmp_path):
+    col, cards = live_col
+    src = extractor.SelectedCards(col, [cards["dog"], cards["pic"], cards["cat"]])
+    assert src.note_count == 3
+    assert src.missing == ["gone.mp3"]
+    out = tmp_path / "out"
+    opts = extractor.ExtractOptions(name_field="Front", number_prefix=True, write_csv=True)
+    result = src.extract(str(out), opts)
+    assert result.names == ["0001_dog.mp3", "0002_cat.mp3", "0002_cat (2).mp3"]
+    assert result.missing == ["gone.mp3"]
+    assert (out / "0001_dog.mp3").read_bytes() == b"audio 3"
+    assert (out / "0002_cat (2).mp3").read_bytes() == b"audio 2"
+    import csv
+
+    with open(result.csv_path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert [(r["number"], r["deck"], r["Front"]) for r in rows] == [
+        ("1", "Mine::Sub", "dog"), ("2", "Mine::Sub", "cat"), ("2", "Mine::Sub", "cat"),
+    ]
+
+
+def test_selected_cards_field_filter(live_col, tmp_path):
+    col, cards = live_col
+    src = extractor.SelectedCards(col, list(cards.values()))
+    assert src.audio_field_names == ["Front", "Back"]
+    opts = extractor.ExtractOptions(audio_fields=frozenset({"Back"}))
+    assert src.extract(str(tmp_path / "out"), opts).names == ["a1.mp3", "a2.mp3", "a4.mp3"]
+
+
+def test_selected_cards_no_audio(live_col, tmp_path):
+    col, cards = live_col
+    src = extractor.SelectedCards(col, [cards["pic"]])
+    assert src.audio_names == [] and src.missing == []
